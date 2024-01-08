@@ -88,3 +88,5 @@ auth.json
 /images
 
 !client/src/components/Nav/SettingsTabs/Data/
+
+nginx/cert
