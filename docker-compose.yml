@@ -32,15 +32,6 @@ services:
     networks:
       - librechat
 
-  nginx:
-    image: nginx
-    ports:
-      - "3080:443"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./nginx/cert:/srv/cert:ro
-    networks:
-      - librechat
-
 networks:
   librechat:
+    external: true
