@@ -1,15 +1,29 @@
 const OpenAI = require('openai');
 const { HttpsProxyAgent } = require('https-proxy-agent');
-const { getResponseSender } = require('librechat-data-provider');
+const {
+  ImageDetail,
+  EModelEndpoint,
+  resolveHeaders,
+  ImageDetailCost,
+  getResponseSender,
+  validateVisionModel,
+  mapModelToAzureConfig,
+} = require('librechat-data-provider');
 const { encoding_for_model: encodingForModel, get_encoding: getEncoding } = require('tiktoken');
-const { encodeAndFormat, validateVisionModel } = require('~/server/services/Files/images');
-const { getModelMaxTokens, genAzureChatCompletion, extractBaseURL } = require('~/utils');
+const {
+  extractBaseURL,
+  constructAzureURL,
+  getModelMaxTokens,
+  genAzureChatCompletion,
+} = require('~/utils');
+const { encodeAndFormat } = require('~/server/services/Files/images/encode');
 const { truncateText, formatMessage, CUT_OFF_PROMPT } = require('./prompts');
 const { handleOpenAIErrors } = require('./tools/util');
 const spendTokens = require('~/models/spendTokens');
 const { createLLM, RunManager } = require('./llm');
-const { isEnabled } = require('~/server/utils');
 const ChatGPTClient = require('./ChatGPTClient');
+const { isEnabled } = require('~/server/utils');
+const { getFiles } = require('~/models/File');
 const { summaryBuffer } = require('./memory');
 const { runTitleChain } = require('./chains');
 const { tokenSplit } = require('./document');
@@ -31,6 +45,7 @@ class OpenAIClient extends BaseClient {
       ? options.contextStrategy.toLowerCase()
       : 'discard';
     this.shouldSummarize = this.contextStrategy === 'summarize';
+    /** @type {AzureOptions} */
     this.azure = options.azure || false;
     this.setOptions(options);
   }
@@ -76,16 +91,7 @@ class OpenAIClient extends BaseClient {
       };
     }
 
-    this.isVisionModel = validateVisionModel(this.modelOptions.model);
-
-    if (this.options.attachments && !this.isVisionModel) {
-      this.modelOptions.model = 'gpt-4-vision-preview';
-      this.isVisionModel = true;
-    }
-
-    if (this.isVisionModel) {
-      delete this.modelOptions.stop;
-    }
+    this.checkVisionRequest(this.options.attachments);
 
     const { OPENROUTER_API_KEY, OPENAI_FORCE_PROMPT } = process.env ?? {};
     if (OPENROUTER_API_KEY && !this.azure) {
@@ -112,10 +118,10 @@ class OpenAIClient extends BaseClient {
     }
 
     if (this.azure && process.env.AZURE_OPENAI_DEFAULT_MODEL) {
-      this.azureEndpoint = genAzureChatCompletion(this.azure, this.modelOptions.model);
+      this.azureEndpoint = genAzureChatCompletion(this.azure, this.modelOptions.model, this);
       this.modelOptions.model = process.env.AZURE_OPENAI_DEFAULT_MODEL;
     } else if (this.azure) {
-      this.azureEndpoint = genAzureChatCompletion(this.azure, this.modelOptions.model);
+      this.azureEndpoint = genAzureChatCompletion(this.azure, this.modelOptions.model, this);
     }
 
     const { model } = this.modelOptions;
@@ -133,7 +139,13 @@ class OpenAIClient extends BaseClient {
     const { isChatGptModel } = this;
     this.isUnofficialChatGptModel =
       model.startsWith('text-chat') || model.startsWith('text-davinci-002-render');
-    this.maxContextTokens = getModelMaxTokens(model) ?? 4095; // 1 less than maximum
+
+    this.maxContextTokens =
+      getModelMaxTokens(
+        model,
+        this.options.endpointType ?? this.options.endpoint,
+        this.options.endpointTokenConfig,
+      ) ?? 4095; // 1 less than maximum
 
     if (this.shouldSummarize) {
       this.maxContextTokens = Math.floor(this.maxContextTokens / 2);
@@ -202,6 +214,27 @@ class OpenAIClient extends BaseClient {
     }
 
     return this;
+  }
+
+  /**
+   *
+   * Checks if the model is a vision model based on request attachments and sets the appropriate options:
+   * - Sets `this.modelOptions.model` to `gpt-4-vision-preview` if the request is a vision request.
+   * - Sets `this.isVisionModel` to `true` if vision request.
+   * - Deletes `this.modelOptions.stop` if vision request.
+   * @param {Array<Promise<MongoFile[]> | MongoFile[]> | Record<string, MongoFile[]>} attachments
+   */
+  checkVisionRequest(attachments) {
+    this.isVisionModel = validateVisionModel(this.modelOptions.model);
+
+    if (attachments && !this.isVisionModel) {
+      this.modelOptions.model = 'gpt-4-vision-preview';
+      this.isVisionModel = true;
+    }
+
+    if (this.isVisionModel) {
+      delete this.modelOptions.stop;
+    }
   }
 
   setupTokens() {
@@ -288,7 +321,11 @@ class OpenAIClient extends BaseClient {
     tokenizerCallsCount++;
   }
 
-  // Returns the token count of a given text. It also checks and resets the tokenizers if necessary.
+  /**
+   * Returns the token count of a given text. It also checks and resets the tokenizers if necessary.
+   * @param {string} text - The text to get the token count for.
+   * @returns {number} The token count of the given text.
+   */
   getTokenCount(text) {
     this.resetTokenizersIfNecessary();
     try {
@@ -301,10 +338,33 @@ class OpenAIClient extends BaseClient {
     }
   }
 
+  /**
+   * Calculate the token cost for an image based on its dimensions and detail level.
+   *
+   * @param {Object} image - The image object.
+   * @param {number} image.width - The width of the image.
+   * @param {number} image.height - The height of the image.
+   * @param {'low'|'high'|string|undefined} [image.detail] - The detail level ('low', 'high', or other).
+   * @returns {number} The calculated token cost.
+   */
+  calculateImageTokenCost({ width, height, detail }) {
+    if (detail === 'low') {
+      return ImageDetailCost.LOW;
+    }
+
+    // Calculate the number of 512px squares
+    const numSquares = Math.ceil(width / 512) * Math.ceil(height / 512);
+
+    // Default to high detail cost calculation
+    return numSquares * ImageDetailCost.HIGH + ImageDetailCost.ADDITIONAL;
+  }
+
   getSaveOptions() {
     return {
       chatGptLabel: this.options.chatGptLabel,
       promptPrefix: this.options.promptPrefix,
+      resendImages: this.options.resendImages,
+      imageDetail: this.options.imageDetail,
       ...this.modelOptions,
     };
   }
@@ -315,6 +375,69 @@ class OpenAIClient extends BaseClient {
       promptPrefix: opts.promptPrefix,
       abortController: opts.abortController,
     };
+  }
+
+  /**
+   *
+   * @param {TMessage[]} _messages
+   * @returns {TMessage[]}
+   */
+  async addPreviousAttachments(_messages) {
+    if (!this.options.resendImages) {
+      return _messages;
+    }
+
+    /**
+     *
+     * @param {TMessage} message
+     */
+    const processMessage = async (message) => {
+      if (!this.message_file_map) {
+        /** @type {Record<string, MongoFile[]> */
+        this.message_file_map = {};
+      }
+
+      const fileIds = message.files.map((file) => file.file_id);
+      const files = await getFiles({
+        file_id: { $in: fileIds },
+      });
+
+      await this.addImageURLs(message, files);
+
+      this.message_file_map[message.messageId] = files;
+      return message;
+    };
+
+    const promises = [];
+
+    for (const message of _messages) {
+      if (!message.files) {
+        promises.push(message);
+        continue;
+      }
+
+      promises.push(processMessage(message));
+    }
+
+    const messages = await Promise.all(promises);
+
+    this.checkVisionRequest(this.message_file_map);
+    return messages;
+  }
+
+  /**
+   *
+   * Adds image URLs to the message object and returns the files
+   *
+   * @param {TMessage[]} messages
+   * @param {MongoFile[]} files
+   * @returns {Promise<MongoFile[]>}
+   */
+  async addImageURLs(message, attachments) {
+    const { files, image_urls } = await encodeAndFormat(this.options.req, attachments);
+
+    message.image_urls = image_urls;
+    return files;
   }
 
   async buildMessages(
@@ -355,13 +478,23 @@ class OpenAIClient extends BaseClient {
     }
 
     if (this.options.attachments) {
-      const attachments = await this.options.attachments;
-      const { files, image_urls } = await encodeAndFormat(
-        this.options.req,
-        attachments.filter((file) => file.type.includes('image')),
+      const attachments = (await this.options.attachments).filter((file) =>
+        file.type.includes('image'),
       );
 
-      orderedMessages[orderedMessages.length - 1].image_urls = image_urls;
+      if (this.message_file_map) {
+        this.message_file_map[orderedMessages[orderedMessages.length - 1].messageId] = attachments;
+      } else {
+        this.message_file_map = {
+          [orderedMessages[orderedMessages.length - 1].messageId]: attachments,
+        };
+      }
+
+      const files = await this.addImageURLs(
+        orderedMessages[orderedMessages.length - 1],
+        attachments,
+      );
+
       this.options.attachments = files;
     }
 
@@ -372,8 +505,23 @@ class OpenAIClient extends BaseClient {
         assistantName: this.options?.chatGptLabel,
       });
 
-      if (this.contextStrategy && !orderedMessages[i].tokenCount) {
+      const needsTokenCount = this.contextStrategy && !orderedMessages[i].tokenCount;
+
+      /* If tokens were never counted, or, is a Vision request and the message has files, count again */
+      if (needsTokenCount || (this.isVisionModel && (message.image_urls || message.files))) {
         orderedMessages[i].tokenCount = this.getTokenCountForMessage(formattedMessage);
+      }
+
+      /* If message has files, calculate image token cost */
+      if (this.message_file_map && this.message_file_map[message.messageId]) {
+        const attachments = this.message_file_map[message.messageId];
+        for (const file of attachments) {
+          orderedMessages[i].tokenCount += this.calculateImageTokenCost({
+            width: file.width,
+            height: file.height,
+            detail: this.options.imageDetail ?? ImageDetail.auto,
+          });
+        }
       }
 
       return formattedMessage;
@@ -412,7 +560,7 @@ class OpenAIClient extends BaseClient {
     let streamResult = null;
     this.modelOptions.user = this.user;
     const invalidBaseUrl = this.completionsUrl && extractBaseURL(this.completionsUrl) === null;
-    const useOldMethod = !!(invalidBaseUrl || !this.isChatCompletion);
+    const useOldMethod = !!(invalidBaseUrl || !this.isChatCompletion || typeof Bun !== 'undefined');
     if (typeof opts.onProgress === 'function' && useOldMethod) {
       await this.getCompletion(
         payload,
@@ -476,7 +624,7 @@ class OpenAIClient extends BaseClient {
       const { finish_reason } = streamResult.choices[0];
       opts.addMetadata({ finish_reason });
     }
-    return reply.trim();
+    return (reply ?? '').trim();
   }
 
   initializeLLM({
@@ -490,6 +638,7 @@ class OpenAIClient extends BaseClient {
     context,
     tokenBuffer,
     initialMessageCount,
+    conversationId,
   }) {
     const modelOptions = {
       modelName: modelName ?? model,
@@ -519,6 +668,16 @@ class OpenAIClient extends BaseClient {
       };
     }
 
+    const { headers } = this.options;
+    if (headers && typeof headers === 'object' && !Array.isArray(headers)) {
+      configOptions.baseOptions = {
+        headers: resolveHeaders({
+          ...headers,
+          ...configOptions?.baseOptions?.headers,
+        }),
+      };
+    }
+
     if (this.options.proxy) {
       configOptions.httpAgent = new HttpsProxyAgent(this.options.proxy);
       configOptions.httpsAgent = new HttpsProxyAgent(this.options.proxy);
@@ -537,7 +696,7 @@ class OpenAIClient extends BaseClient {
       callbacks: runManager.createCallbacks({
         context,
         tokenBuffer,
-        conversationId: this.conversationId,
+        conversationId: this.conversationId ?? conversationId,
         initialMessageCount,
       }),
     });
@@ -553,12 +712,13 @@ class OpenAIClient extends BaseClient {
    *
    * @param {Object} params - The parameters for the conversation title generation.
    * @param {string} params.text - The user's input.
+   * @param {string} [params.conversationId] - The current conversationId, if not already defined on client initialization.
    * @param {string} [params.responseText=''] - The AI's immediate response to the user.
    *
    * @returns {Promise<string | 'New Chat'>} A promise that resolves to the generated conversation title.
    *                            In case of failure, it will return the default title, "New Chat".
    */
-  async titleConvo({ text, responseText = '' }) {
+  async titleConvo({ text, conversationId, responseText = '' }) {
     let title = 'New Chat';
     const convo = `||>User:
 "${truncateText(text)}"
@@ -578,12 +738,44 @@ class OpenAIClient extends BaseClient {
       max_tokens: 16,
     };
 
+    /** @type {TAzureConfig | undefined} */
+    const azureConfig = this.options?.req?.app?.locals?.[EModelEndpoint.azureOpenAI];
+
+    const resetTitleOptions =
+      (this.azure && azureConfig) ||
+      (azureConfig && this.options.endpoint === EModelEndpoint.azureOpenAI);
+
+    if (resetTitleOptions) {
+      const { modelGroupMap, groupMap } = azureConfig;
+      const {
+        azureOptions,
+        baseURL,
+        headers = {},
+        serverless,
+      } = mapModelToAzureConfig({
+        modelName: modelOptions.model,
+        modelGroupMap,
+        groupMap,
+      });
+
+      this.options.headers = resolveHeaders(headers);
+      this.options.reverseProxyUrl = baseURL ?? null;
+      this.langchainProxy = extractBaseURL(this.options.reverseProxyUrl);
+      this.apiKey = azureOptions.azureOpenAIApiKey;
+
+      const groupName = modelGroupMap[modelOptions.model].group;
+      this.options.addParams = azureConfig.groupMap[groupName].addParams;
+      this.options.dropParams = azureConfig.groupMap[groupName].dropParams;
+      this.options.forcePrompt = azureConfig.groupMap[groupName].forcePrompt;
+      this.azure = !serverless && azureOptions;
+    }
+
     const titleChatCompletion = async () => {
       modelOptions.model = model;
 
       if (this.azure) {
         modelOptions.model = process.env.AZURE_OPENAI_DEFAULT_MODEL ?? modelOptions.model;
-        this.azureEndpoint = genAzureChatCompletion(this.azure, modelOptions.model);
+        this.azureEndpoint = genAzureChatCompletion(this.azure, modelOptions.model, this);
       }
 
       const instructionsPayload = [
@@ -618,7 +810,12 @@ ${convo}
 
     try {
       this.abortController = new AbortController();
-      const llm = this.initializeLLM({ ...modelOptions, context: 'title', tokenBuffer: 150 });
+      const llm = this.initializeLLM({
+        ...modelOptions,
+        conversationId,
+        context: 'title',
+        tokenBuffer: 150,
+      });
       title = await runTitleChain({ llm, text, convo, signal: this.abortController.signal });
     } catch (e) {
       if (e?.message?.toLowerCase()?.includes('abort')) {
@@ -645,7 +842,12 @@ ${convo}
     // TODO: remove the gpt fallback and make it specific to endpoint
     const { OPENAI_SUMMARY_MODEL = 'gpt-3.5-turbo' } = process.env ?? {};
     const model = this.options.summaryModel ?? OPENAI_SUMMARY_MODEL;
-    const maxContextTokens = getModelMaxTokens(model) ?? 4095;
+    const maxContextTokens =
+      getModelMaxTokens(
+        model,
+        this.options.endpointType ?? this.options.endpoint,
+        this.options.endpointTokenConfig,
+      ) ?? 4095; // 1 less than maximum
 
     // 3 tokens for the assistant label, and 98 for the summarizer prompt (101)
     let promptBuffer = 101;
@@ -751,6 +953,7 @@ ${convo}
         model: this.modelOptions.model,
         context: 'message',
         conversationId: this.conversationId,
+        endpointTokenConfig: this.options.endpointTokenConfig,
       },
       { promptTokens, completionTokens },
     );
@@ -780,7 +983,6 @@ ${convo}
       if (this.isChatCompletion) {
         modelOptions.messages = payload;
       } else {
-        // TODO: unreachable code. Need to implement completions call for non-chat models
         modelOptions.prompt = payload;
       }
 
@@ -818,24 +1020,79 @@ ${convo}
         modelOptions.max_tokens = 4000;
       }
 
+      /** @type {TAzureConfig | undefined} */
+      const azureConfig = this.options?.req?.app?.locals?.[EModelEndpoint.azureOpenAI];
+
+      if (
+        (this.azure && this.isVisionModel && azureConfig) ||
+        (azureConfig && this.isVisionModel && this.options.endpoint === EModelEndpoint.azureOpenAI)
+      ) {
+        const { modelGroupMap, groupMap } = azureConfig;
+        const {
+          azureOptions,
+          baseURL,
+          headers = {},
+          serverless,
+        } = mapModelToAzureConfig({
+          modelName: modelOptions.model,
+          modelGroupMap,
+          groupMap,
+        });
+        opts.defaultHeaders = resolveHeaders(headers);
+        this.langchainProxy = extractBaseURL(baseURL);
+        this.apiKey = azureOptions.azureOpenAIApiKey;
+
+        const groupName = modelGroupMap[modelOptions.model].group;
+        this.options.addParams = azureConfig.groupMap[groupName].addParams;
+        this.options.dropParams = azureConfig.groupMap[groupName].dropParams;
+        // Note: `forcePrompt` not re-assigned as only chat models are vision models
+
+        this.azure = !serverless && azureOptions;
+        this.azureEndpoint =
+          !serverless && genAzureChatCompletion(this.azure, modelOptions.model, this);
+      }
+
       if (this.azure || this.options.azure) {
         // Azure does not accept `model` in the body, so we need to remove it.
         delete modelOptions.model;
 
-        opts.baseURL = this.azureEndpoint.split('/chat')[0];
+        opts.baseURL = this.langchainProxy
+          ? constructAzureURL({
+            baseURL: this.langchainProxy,
+            azure: this.azure,
+          })
+          : this.azureEndpoint.split(/\/(chat|completion)/)[0];
         opts.defaultQuery = { 'api-version': this.azure.azureOpenAIApiVersion };
         opts.defaultHeaders = { ...opts.defaultHeaders, 'api-key': this.apiKey };
       }
 
+      if (process.env.OPENAI_ORGANIZATION) {
+        opts.organization = process.env.OPENAI_ORGANIZATION;
+      }
+
       let chatCompletion;
+      /** @type {OpenAI} */
       const openai = new OpenAI({
         apiKey: this.apiKey,
         ...opts,
       });
 
-      /* hacky fix for Mistral AI API not allowing a singular system message in payload */
+      /* hacky fixes for Mistral AI API:
+      - Re-orders system message to the top of the messages payload, as not allowed anywhere else
+      - If there is only one message and it's a system message, change the role to user
+      */
       if (opts.baseURL.includes('https://api.mistral.ai/v1') && modelOptions.messages) {
         const { messages } = modelOptions;
+
+        const systemMessageIndex = messages.findIndex((msg) => msg.role === 'system');
+
+        if (systemMessageIndex > 0) {
+          const [systemMessage] = messages.splice(systemMessageIndex, 1);
+          messages.unshift(systemMessage);
+        }
+
+        modelOptions.messages = messages;
+
         if (messages.length === 1 && messages[0].role === 'system') {
           modelOptions.messages[0].role = 'user';
         }
@@ -846,11 +1103,19 @@ ${convo}
           ...modelOptions,
           ...this.options.addParams,
         };
+        logger.debug('[OpenAIClient] chatCompletion: added params', {
+          addParams: this.options.addParams,
+          modelOptions,
+        });
       }
 
       if (this.options.dropParams && Array.isArray(this.options.dropParams)) {
         this.options.dropParams.forEach((param) => {
           delete modelOptions[param];
+        });
+        logger.debug('[OpenAIClient] chatCompletion: dropped params', {
+          dropParams: this.options.dropParams,
+          modelOptions,
         });
       }
 
@@ -866,6 +1131,16 @@ ${convo}
           })
           .on('error', (err) => {
             handleOpenAIErrors(err, errorCallback, 'stream');
+          })
+          .on('finalChatCompletion', (finalChatCompletion) => {
+            const finalMessage = finalChatCompletion?.choices?.[0]?.message;
+            if (finalMessage && finalMessage?.role !== 'assistant') {
+              finalChatCompletion.choices[0].message.role = 'assistant';
+            }
+
+            if (finalMessage && !finalMessage?.content?.trim()) {
+              finalChatCompletion.choices[0].message.content = intermediateReply;
+            }
           })
           .on('finalMessage', (message) => {
             if (message?.role !== 'assistant') {
@@ -916,6 +1191,16 @@ ${convo}
         clientOptions.addMetadata({ finish_reason });
       }
 
+      logger.debug('[OpenAIClient] chatCompletion response', chatCompletion);
+
+      if (!message?.content?.trim() && intermediateReply.length) {
+        logger.debug(
+          '[OpenAIClient] chatCompletion: using intermediateReply due to empty message.content',
+          { intermediateReply },
+        );
+        return intermediateReply;
+      }
+
       return message.content;
     } catch (err) {
       if (
@@ -927,6 +1212,9 @@ ${convo}
       if (
         err?.message?.includes(
           'OpenAI error: Invalid final message: OpenAI expects final message to include role=assistant',
+        ) ||
+        err?.message?.includes(
+          'stream ended without producing a ChatCompletionMessage with role=assistant',
         ) ||
         err?.message?.includes('The server had an error processing your request') ||
         err?.message?.includes('missing finish_reason') ||

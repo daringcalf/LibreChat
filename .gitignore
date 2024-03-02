@@ -69,6 +69,7 @@ src/style - official.css
 .DS_Store
 *.code-workspace
 .idea
+*.iml
 *.pem
 config.local.ts
 **/storageState.json
@@ -88,5 +89,8 @@ auth.json
 /images
 
 !client/src/components/Nav/SettingsTabs/Data/
+
+# User uploads
+uploads/
 
 nginx/cert

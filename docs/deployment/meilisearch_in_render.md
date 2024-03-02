@@ -40,7 +40,7 @@ weight: -3
 | --- | --- |
 | MEILI_HOST | http://meilisearch:7700 |
 | MEILI_HTTP_ADDR | meilisearch:7700 |
-| MEILI_MASTER_KEY | DrhYf7zENyR6AlUCKmnz0eYASOQdl6zxH7s7MKFSfFCt | 
+| MEILI_MASTER_KEY | Create a 44 character alphanunmeric key | 
 | MEILI_NO_ANALYTICS | true |
 
 **Deployment**
@@ -63,13 +63,13 @@ Once you get the message: `your service is live 🎉`, copy the URL address of y
 
 Now, insert the below environment variable values into your LibreChat project (Replace MEILI_HOST by adding the URL address of your Render's Meilisearch project that you copied):
 
-| Key | Value |
-| --- | --- |
-| MEILI_HOST | Your Render project's Meilisearch URL|
-| MEILI_HTTP_ADDR | meilisearch:7700 |
-| MEILI_MASTER_KEY | DrhYf7zENyR6AlUCKmnz0eYASOQdl6zxH7s7MKFSfFCt | 
-| MEILI_NO_ANALYTICS | true |
-| SEARCH | true |
+| Key | Value                                 |
+| --- |---------------------------------------|
+| MEILI_HOST | Your Render project's Meilisearch URL |
+| MEILI_HTTP_ADDR | meilisearch:7700                      |
+| MEILI_MASTER_KEY | Use the key created for Meilisearch   | 
+| MEILI_NO_ANALYTICS | true                                  |
+| SEARCH | true                                  |
 
   ![image](https://github.com/danny-avila/LibreChat/assets/32828263/f4ff1310-dc6b-4a81-944e-0eece8606b86)
 
@@ -86,4 +86,4 @@ Now, insert the below environment variable values into your LibreChat project (R
 ## Conclusion
 Now, you should be able to perform searches again, congratulations, you have successfully deployed Meilisearch on render.com
 
-### Note: If you are still having issues, before creating a new issue, please search for similar issues on our [#issues thread on our discord](https://discord.gg/weqZFtD9C4) or on our [troubleshooting discussion](https://github.com/danny-avila/LibreChat/discussions/categories/troubleshooting) on our Discussion page. If you cannot find a relevant issue, feel free to create a new one and provide as many details as possible.
+### Note: If you are still having issues, before creating a new issue, please search for similar issues on our [#issues thread on our discord](https://discord.librechat.ai) or on our [troubleshooting discussion](https://github.com/danny-avila/LibreChat/discussions/categories/troubleshooting) on our Discussion page. If you cannot find a relevant issue, feel free to create a new one and provide as many details as possible.
