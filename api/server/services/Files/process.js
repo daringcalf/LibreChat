@@ -1,5 +1,6 @@
 const path = require('path');
 const { v4 } = require('uuid');
+const axios = require('axios');
 const mime = require('mime/lite');
 const {
   isUUID,
@@ -11,7 +12,7 @@ const {
   mergeFileConfig,
 } = require('librechat-data-provider');
 const { convertToWebP, resizeAndConvert } = require('~/server/services/Files/images');
-const { initializeClient } = require('~/server/services/Endpoints/assistant');
+const { initializeClient } = require('~/server/services/Endpoints/assistants');
 const { createFile, updateFileUsage, deleteFiles } = require('~/models/File');
 const { isEnabled, determineFileType } = require('~/server/utils');
 const { LB_QueueAsyncCall } = require('~/server/utils/queue');
@@ -147,7 +148,11 @@ const processDeleteRequest = async ({ req, files }) => {
 const processFileURL = async ({ fileStrategy, userId, URL, fileName, basePath, context }) => {
   const { saveURL, getFileURL } = getStrategyFunctions(fileStrategy);
   try {
-    const { bytes, type, dimensions } = await saveURL({ userId, URL, fileName, basePath });
+    const {
+      bytes = 0,
+      type = '',
+      dimensions = {},
+    } = (await saveURL({ userId, URL, fileName, basePath })) || {};
     const filepath = await getFileURL({ fileName: `${userId}/${fileName}`, basePath });
     return await createFile(
       {
@@ -184,8 +189,15 @@ const processFileURL = async ({ fileStrategy, userId, URL, fileName, basePath, c
 const processImageFile = async ({ req, res, file, metadata }) => {
   const source = req.app.locals.fileStrategy;
   const { handleImageUpload } = getStrategyFunctions(source);
-  const { file_id, temp_file_id } = metadata;
-  const { filepath, bytes, width, height } = await handleImageUpload(req, file);
+  const { file_id, temp_file_id, endpoint } = metadata;
+
+  const { filepath, bytes, width, height } = await handleImageUpload({
+    req,
+    file,
+    file_id,
+    endpoint,
+  });
+
   const result = await createFile(
     {
       user: req.user.id,
@@ -257,13 +269,46 @@ const processFileUpload = async ({ req, res, file, metadata }) => {
   const { handleFileUpload } = getStrategyFunctions(source);
   const { file_id, temp_file_id } = metadata;
 
+  let embedded = false;
+  if (process.env.RAG_API_URL) {
+    try {
+      const jwtToken = req.headers.authorization.split(' ')[1];
+      const filepath = `./uploads/temp/${file.path.split('uploads/temp/')[1]}`;
+      const response = await axios.post(
+        `${process.env.RAG_API_URL}/embed`,
+        {
+          filename: file.originalname,
+          file_content_type: file.mimetype,
+          filepath,
+          file_id,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${jwtToken}`,
+            'Content-Type': 'application/json',
+          },
+        },
+      );
+
+      if (response.status === 200) {
+        embedded = true;
+      }
+    } catch (error) {
+      logger.error('Error embedding file', error);
+      throw new Error(error);
+    }
+  } else if (!isAssistantUpload) {
+    logger.error('RAG_API_URL not set, cannot support process file upload');
+    throw new Error('RAG_API_URL not set, cannot support process file upload');
+  }
+
   /** @type {OpenAI | undefined} */
   let openai;
   if (source === FileSources.openai) {
     ({ openai } = await initializeClient({ req }));
   }
 
-  const { id, bytes, filename, filepath } = await handleFileUpload(req, file, openai);
+  const { id, bytes, filename, filepath } = await handleFileUpload({ req, file, file_id, openai });
 
   if (isAssistantUpload && !metadata.message_file) {
     await openai.beta.assistants.files.create(metadata.assistant_id, {
@@ -277,11 +322,12 @@ const processFileUpload = async ({ req, res, file, metadata }) => {
       file_id: id ?? file_id,
       temp_file_id,
       bytes,
-      filepath: isAssistantUpload ? `https://api.openai.com/v1/files/${id}` : filepath,
+      filepath: isAssistantUpload ? `${openai.baseURL}/files/${id}` : filepath,
       filename: filename ?? file.originalname,
       context: isAssistantUpload ? FileContext.assistants : FileContext.message_attachment,
-      source,
       type: file.mimetype,
+      embedded,
+      source,
     },
     true,
   );
